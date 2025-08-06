@@ -1,6 +1,10 @@
 import sqlite3
 import json
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta
 from openai import OpenAI
 from langgraph.graph import StateGraph
 from typing import TypedDict, Dict, List, Optional
@@ -9,30 +13,334 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
+email_password = os.getenv("EMAIL_PASSWORD")
+email_address = os.getenv("EMAIL_ADDRESS")
 
 if not openai_api_key:
     raise EnvironmentError("OPENAI_API_KEY not found in environment. Make sure your .env file is correctly configured.")
 
-
-class QuizState(TypedDict): #creating a custom dictionary type called QuizState that inherits from TypedDict. Each key of the dictionary has a name and a specific expected type.
-    user_name: str #This key must be a string.
-    user_answers: Dict[str, str] #both keys and values are strings each key is question number and value is the answer.
-    score: Optional[int] #it represents the user total score. optional means either int or none.
-    level: Optional[str] #it indicates proficiency level based on score.
-    roadmap: Optional[List[str]] #it indicates list of strings which is roadmap generated after quiz evaluation.
+if not email_password or not email_address:
+    raise EnvironmentError("EMAIL_PASSWORD and EMAIL_ADDRESS not found in environment. Configure your email settings.")
 
 
-class QuizApp: #this is custom class it will encapsulate all the logic and state of quiz application.
-    def __init__(self, api_key: str): #constructor method that contains API key which is a string.
-        self.client = OpenAI(api_key=api_key) #This line creates an instance of the OpenAI client using the provided API key.
-        self.correct_answers = {  #This dictionary holds the correct answers for each quiz question.
+class QuizState(TypedDict):
+    user_name: str
+    user_answers: Dict[str, str]
+    score: Optional[int]
+    level: Optional[str]
+    roadmap: Optional[List[str]]
+
+
+class TaskManager:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self.setup_database()
+    
+    def setup_database(self):
+        """Setup database tables for tasks and progress tracking"""
+        conn = sqlite3.connect("user_learning.db")
+        cursor = conn.cursor()
+        
+        # Create tasks table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            task_number INTEGER NOT NULL,
+            task_description TEXT NOT NULL,
+            assigned_date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            submitted_date TEXT,
+            submission_content TEXT
+        )
+        """)
+        
+        # Create user_progress table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            user_email TEXT NOT NULL,
+            quiz_score INTEGER,
+            level TEXT,
+            roadmap TEXT,
+            last_task_assigned TEXT,
+            tasks_completed INTEGER DEFAULT 0
+        )
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def send_email(self, to_email: str, subject: str, body: str):
+        """Send email using SMTP"""
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['From'] = email_address
+            msg['To'] = to_email
+            msg['Subject'] = subject
+            
+            # Add both HTML and plain text versions
+            html_part = MIMEText(body, 'html')
+            msg.attach(html_part)
+            
+            # Create SMTP session
+            server = smtplib.SMTP('smtp.gmail.com', 587)
+            server.starttls()
+            
+            # Login to the server
+            server.login(email_address, email_password)
+            
+            # Send email
+            text = msg.as_string()
+            server.sendmail(email_address, to_email, text)
+            server.quit()
+            
+            print(f"Email sent successfully to {to_email}")
+            return True
+            
+        except smtplib.SMTPAuthenticationError:
+            print("SMTP Authentication failed. Check your email and app password.")
+            return False
+        except smtplib.SMTPRecipientsRefused:
+            print("Recipient email address is invalid.")
+            return False
+        except smtplib.SMTPServerDisconnected:
+            print("SMTP server disconnected unexpectedly.")
+            return False
+        except Exception as e:
+            print(f"Email sending failed: {str(e)}")
+            return False
+    
+    def generate_task(self, user_name: str, level: str, roadmap: List[str], task_number: int, previous_task: str = None):
+        """Generate AI-based task based on user's performance and roadmap"""
+        prompt = f"""
+        Generate a learning task for a user named {user_name} who is at {level} level.
+        
+        User's Learning Roadmap:
+        {chr(10).join(roadmap)}
+        
+        Task Number: {task_number}
+        """
+        
+        if task_number == 2 and previous_task:
+            prompt += f"""
+            Previous Task: {previous_task}
+            
+            Generate a follow-up task that builds upon the previous task and continues the learning journey.
+            """
+        else:
+            prompt += """
+            Generate an initial task that helps the user start their learning journey based on their roadmap.
+            """
+        
+        prompt += """
+        Requirements:
+        - Task should be practical and hands-on
+        - Include specific learning objectives
+        - Provide clear instructions
+        - Suggest resources or tools if needed
+        - Make it achievable within 3-4 days
+        - Include a brief explanation of why this task is important for their learning
+        
+        Format the response as a clear, structured task description.
+        """
+        
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert learning coach that creates personalized, practical learning tasks."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        return response.choices[0].message.content.strip()
+    
+    def assign_task(self, user_name: str, user_email: str, level: str, roadmap: List[str]):
+        """Assign a new task to the user"""
+        conn = sqlite3.connect("user_learning.db")
+        cursor = conn.cursor()
+        
+        # Check if user has existing tasks
+        cursor.execute("""
+        SELECT task_number, task_description, status FROM tasks 
+        WHERE user_email = ? ORDER BY task_number DESC LIMIT 1
+        """, (user_email,))
+        
+        result = cursor.fetchone()
+        
+        # Determine task number and check if previous task is completed
+        if not result:
+            task_number = 1
+            previous_task = None
+        else:
+            last_task_number, last_task_description, last_task_status = result
+            
+            # Only assign task 2 if task 1 is completed
+            if last_task_number == 1 and last_task_status != 'completed':
+                return {
+                    "error": True,
+                    "message": "Task 1 must be completed before Task 2 can be assigned. Please submit your first task first."
+                }
+            elif last_task_number == 2 and last_task_status != 'completed':
+                return {
+                    "error": True,
+                    "message": "You already have Task 2 assigned. Please complete it before requesting a new task."
+                }
+            elif last_task_number >= 2:
+                return {
+                    "error": True,
+                    "message": "You have completed all available tasks. Great job!"
+                }
+            
+            task_number = last_task_number + 1
+            previous_task = last_task_description
+        
+        # Generate new task
+        task_description = self.generate_task(user_name, level, roadmap, task_number, previous_task)
+        
+        # Calculate due date (3 days from now)
+        assigned_date = datetime.now().strftime("%Y-%m-%d")
+        due_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
+        
+        # Save task to database
+        cursor.execute("""
+        INSERT INTO tasks (user_name, user_email, task_number, task_description, assigned_date, due_date, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (user_name, user_email, task_number, task_description, assigned_date, due_date))
+        
+        task_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        
+        # Send email notification
+        subject = f"New Learning Task #{task_number} - {user_name}"
+        body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h2 style="color: #2c3e50;">Hello {user_name}!</h2>
+                <p>You have been assigned a new learning task based on your quiz performance.</p>
+                
+                <div style="background-color: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin: 20px 0; border-radius: 5px;">
+                    <h3 style="color: #007bff; margin-top: 0;">Task #{task_number}</h3>
+                    <div style="white-space: pre-line;">{task_description}</div>
+                </div>
+                
+                <div style="background-color: #e8f5e8; border: 1px solid #28a745; padding: 10px; border-radius: 5px; margin: 15px 0;">
+                    <p style="margin: 0;"><strong>Due Date:</strong> {due_date}</p>
+                </div>
+                
+                <p>To submit your task, please reply to this email with your work or use the submit button in the app.</p>
+                
+                <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+                    <p style="color: #666; font-size: 14px;">Keep up the great work!</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        email_sent = self.send_email(user_email, subject, body)
+        
+        return {
+            "task_id": task_id,
+            "task_number": task_number,
+            "task_description": task_description,
+            "due_date": due_date,
+            "email_sent": email_sent,
+            "error": False
+        }
+    
+    def submit_task(self, user_email: str, task_id: int, submission_content: str):
+        """Submit a completed task"""
+        conn = sqlite3.connect("user_learning.db")
+        cursor = conn.cursor()
+        
+        # Update task status
+        submitted_date = datetime.now().strftime("%Y-%m-%d")
+        cursor.execute("""
+        UPDATE tasks 
+        SET status = 'completed', submitted_date = ?, submission_content = ?
+        WHERE id = ? AND user_email = ?
+        """, (submitted_date, submission_content, task_id, user_email))
+        
+        if cursor.rowcount > 0:
+            # Update user progress
+            cursor.execute("""
+            UPDATE user_progress 
+            SET tasks_completed = tasks_completed + 1
+            WHERE user_email = ?
+            """, (user_email,))
+            
+            conn.commit()
+            conn.close()
+            
+            # Send confirmation email
+            subject = "Task Submission Confirmed"
+            body = f"""
+            <html>
+            <body>
+                <h2>Task Submission Confirmed!</h2>
+                <p>Your task has been successfully submitted and recorded.</p>
+                <p>We'll review your work and assign the next task soon.</p>
+                <p>Keep up the excellent progress!</p>
+            </body>
+            </html>
+            """
+            
+            self.send_email(user_email, subject, body)
+            
+            return {"success": True, "message": "Task submitted successfully!"}
+        else:
+            conn.close()
+            return {"success": False, "message": "Task not found or already submitted."}
+    
+    def get_user_tasks(self, user_email: str):
+        """Get all tasks for a user"""
+        conn = sqlite3.connect("user_learning.db")
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+        SELECT id, task_number, task_description, assigned_date, due_date, status, submitted_date
+        FROM tasks 
+        WHERE user_email = ? 
+        ORDER BY task_number
+        """, (user_email,))
+        
+        tasks = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "id": task[0],
+                "task_number": task[1],
+                "description": task[2],
+                "assigned_date": task[3],
+                "due_date": task[4],
+                "status": task[5],
+                "submitted_date": task[6]
+            }
+            for task in tasks
+        ]
+
+
+class QuizApp:
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key)
+        self.correct_answers = {
             "1": "c", "2": "b", "3": "d", "4": "a", "5": "a", 
             "6": "c", "7": "d", "8": "c", "9": "b", "10": "c"
-        } # This enables automated scoring after the quiz is submitted.
-        self.graph = self.build_graph()#This line builds the LangGraph state machine by calling a custom method build_graph() defined later in the class.
-        self.app = self.graph.compile()#This compiles the LangGraph object (self.graph) into a runnable application.
+        }
+        self.graph = self.build_graph()
+        self.app = self.graph.compile()
+        self.task_manager = TaskManager(api_key)
 
-    def start_quiz(self, state):#This begins the definition of a dictionary named questions.self refers to the current instance of the class.State a dictionary (likely of type `QuizState`) that holds information about the current user
+    def start_quiz(self, state):
         questions = {
         "1": {
             "text": "What is the correct file extension for Python files?",
@@ -72,25 +380,25 @@ class QuizApp: #this is custom class it will encapsulate all the logic and state
         },
         "10": {
             "text": "Main difference: supervised vs unsupervised learning?",
-            "options": {"a": "Supervised doesn’t use labels", "b": "Supervised is faster", "c": "Supervised uses labels", "d": "No difference"}
+            "options": {"a": "Supervised doesn't use labels", "b": "Supervised is faster", "c": "Supervised uses labels", "d": "No difference"}
         },
     }
 
-        return { #This line returns a dictionary. It's the output of the start_quiz method.
-        "quiz": questions, #Adds a key called "quiz" which contains the entire `questions` dictionary.
-        "message": f"Welcome {state.get('user_name', 'Guest')}! Please answer the following quiz questions." #Adds a "message" key that returns a personalized welcome message.
+        return {
+        "quiz": questions,
+        "message": f"Welcome {state.get('user_name', 'Guest')}! Please answer the following quiz questions."
     }
 
     def evaluate_quiz(self, state):
-        user_answers = state.get("user_answers", {}) #Tries to retrieve the value associated with the key "user_answers" from the state dictionary.If the key is missing, it defaults to an empty dictionary {}.
-        score = sum( #score will store the total number of correct answer by the user.
-            1 for q_no, correct in self.correct_answers.items()#this is a generator expression that iterates through each question number (q_no) and correct option (correct) from the self.correct_answers dictionary.
-            if user_answers.get(q_no, "").lower().strip() == correct#this is a condition that checks if the user's answer for the current question (q_no) matches the correct answer (correct).
+        user_answers = state.get("user_answers", {})
+        score = sum(
+            1 for q_no, correct in self.correct_answers.items()
+            if user_answers.get(q_no, "").lower().strip() == correct
         )
-        return {"score": score}#Returns a dictionary with the calculated score.
+        return {"score": score}
 
-    def check_proficiency(self, state):#This method checks the proficiency level of the user based on their score.
-        score = state["score"]#This line retrieves the score from the state dictionary.
+    def check_proficiency(self, state):
+        score = state["score"]
         if score <= 3:
             level = "Beginner"
         elif score <= 6:
@@ -99,12 +407,12 @@ class QuizApp: #this is custom class it will encapsulate all the logic and state
             level = "Advanced"
         return {"level": level}
 
-    def suggest_roadmap(self, state):#This method generates a personalized learning roadmap based on the user's quiz answers.
-        user_answers = state.get("user_answers", {})#This line retrieves the user's answers from the state dictionary.
-        score = state.get("score")#This line retrieves the score from the state dictionary.
-        level = state.get("level")#This line retrieves the proficiency level from the state dictionary.
+    def suggest_roadmap(self, state):
+        user_answers = state.get("user_answers", {})
+        score = state.get("score")
+        level = state.get("level")
 
-        question_topics = { #This dictionary maps each question number to a topic.
+        question_topics = {
             "1": "Python syntax and file handling",
             "2": "Python operator precedence",
             "3": "Python data structures - Dictionary",
@@ -117,14 +425,14 @@ class QuizApp: #this is custom class it will encapsulate all the logic and state
             "10": "Difference between supervised and unsupervised learning"
         }
 
-        wrong_questions = []#This list will store questions that the user got wrong.
-        correct_questions = []#This list will store questions that the user got correct.
+        wrong_questions = []
+        correct_questions = []
 
-        for q_no, correct_ans in self.correct_answers.items():#This loop iterates through each question number (q_no) and correct answer (correct_ans) from the self.correct_answers dictionary.
-            if user_answers.get(q_no, "").lower().strip() == correct_ans: #This condition checks if the user's answer for the current question (q_no) matches the correct answer (correct_ans).
-                correct_questions.append((q_no, question_topics[q_no])) #If the user's answer is correct, it adds the question number and topic to the correct_questions list.
+        for q_no, correct_ans in self.correct_answers.items():
+            if user_answers.get(q_no, "").lower().strip() == correct_ans:
+                correct_questions.append((q_no, question_topics[q_no]))
             else:
-                wrong_questions.append((q_no, question_topics[q_no])) #If the user's answer is incorrect, it adds the question number and topic to the wrong_questions list.
+                wrong_questions.append((q_no, question_topics[q_no]))
 
         prompt = f""" 
 You are an AI tutor. A user scored {score}/10 in AI quiz and is categorized as {level} level.
@@ -147,121 +455,136 @@ Now generate a focused learning roadmap:
 - Then briefly reinforce strong areas (encourage practice or learning deeper concepts).
 
 Return the roadmap as a structured list:
-- Use numbering or bullet points.
-- Use indentation for resources or sub-items.
-- Add line breaks between major sections to make it readable in a terminal.
-"""#This is the string that conatin prompt for AI tutor to generate a personalized learning roadmap.
+- Use clear section headers like "Weak Areas" and "Strong Areas"
+- Use numbered lists for main topics
+- Use bullet points for resources and sub-items
+- Keep descriptions concise and actionable
+- Focus on practical learning steps
+"""
 
-        response = self.client.chat.completions.create(#This line creates a chat completion using the OpenAI API.
-            model="gpt-4o",#This specifies the model to use for the chat completion.
-            messages=[ #This is a list of messages that will be sent to the AI tutor.
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
                 {"role": "system", "content": "You are an expert tutor that builds personalized learning plans."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7, #This sets the temperature to reduce hallucinations.
-            max_tokens=700, #This sets the maximum number of tokens in the response.
+            temperature=0.7,
+            max_tokens=700,
         )
 
-        roadmap_text = response.choices[0].message.content.strip() #This line extracts the content of the response.
-        roadmap_lines = [] #This list will store the roadmap as a list of strings.
-        for line in roadmap_text.splitlines(): #This loop iterates through each line in the roadmap text.
-            stripped = line.strip() #This line removes any leading or trailing whitespace from the line.
-            if not stripped: #This condition checks if the line is empty.
-                roadmap_lines.append("") #If the line is empty, it adds an empty string to the roadmap_lines list.
+        roadmap_text = response.choices[0].message.content.strip()
+        roadmap_lines = []
+        for line in roadmap_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                roadmap_lines.append("")
                 continue
-            if stripped.lower().startswith("weak areas") or "reinforce" in stripped.lower(): #This condition checks if the line start with "weak areas" or contains "reinforce" in lowercase.
-                roadmap_lines.append("") #If the line start with "weak areas" or contains "reinforce" in lowercase, it adds an empty string to the roadmap_lines list.
-                roadmap_lines.append(f"{stripped}".center(60, "-")) #This line centers the line with 60 characters and dashes.
-                roadmap_lines.append("") #This line adds an empty string to the roadmap_lines list.
+            if stripped.lower().startswith("weak areas") or "reinforce" in stripped.lower():
+                roadmap_lines.append("")
+                roadmap_lines.append(f"**{stripped}**")
+                roadmap_lines.append("")
                 continue
-            if stripped[:1].isdigit() and "." in stripped[:3]: #This condition checks if the line starts with a digit and contains a dot in the first three characters.
-                roadmap_lines.append(f"  {stripped}") #If the line starts with a digit and contains a dot in the first three characters, it adds the line to the roadmap_lines list.
-            elif stripped.startswith(("-", "*")): #This condition checks if the line starts with a dash or an asterisk.
-                roadmap_lines.append(f"     - {stripped[1:].strip()}") #If the line starts with a dash or an asterisk, it adds the line to the roadmap_lines list.
+            if stripped[:1].isdigit() and "." in stripped[:3]:
+                roadmap_lines.append(f"**{stripped}**")
+            elif stripped.startswith(("-", "*")):
+                roadmap_lines.append(f"  • {stripped[1:].strip()}")
             else:
-                roadmap_lines.append(f"     {stripped}") #If the line does not start with a digit and does not start with a dash or an asterisk, it adds the line to the roadmap_lines list.
-        return {"roadmap": roadmap_lines} #This line returns a dictionary with the roadmap as a list of strings.
+                roadmap_lines.append(f"  {stripped}")
+        return {"roadmap": roadmap_lines}
 
-    def store_result(self, state): #This method stores the result of the quiz in a database.
-        name = state.get("user_name", "Unknown") #This line retrieves the user's name from the state dictionary.
-        roadmap = state.get("roadmap", []) #This line retrieves the roadmap from the state dictionary.
-        score = state.get("score") #This line retrieves the score from the state dictionary.
-        level = state.get("level") #This line retrieves the proficiency level from the dictionary.
+    def store_result(self, state):
+        name = state.get("user_name", "Unknown")
+        roadmap = state.get("roadmap", [])
+        score = state.get("score")
+        level = state.get("level")
 
-        roadmap_str = json.dumps(roadmap) #This line converts the roadmap list into a JSON string.
-        conn = sqlite3.connect("user_learning.db") #This line connects to the SQLite database file named "user_learning.db"
-        cursor = conn.cursor() #This line creates a cursor object that allows us to execute SQL commands.
+        roadmap_str = json.dumps(roadmap)
+        conn = sqlite3.connect("user_learning.db")
+        cursor = conn.cursor()
         cursor.execute(""" 
         INSERT INTO users (name, score, level, roadmap)
         VALUES (?, ?, ?, ?)
-        """, (name, score, level, roadmap_str)) #This line executes an SQL command to insert the user's name, score, level, and roadmap into the database.
-        conn.commit() #This line commits the changes to the database.
-        conn.close() #This line closes the connection to the database.
+        """, (name, score, level, roadmap_str))
+        conn.commit()
+        conn.close()
 
-        return {"message": f"Roadmap saved for {name}."} #This line returns a dictionary with a message indicating that the roadmap has been saved.
+        return {"message": f"Roadmap saved for {name}."}
 
-    def end(self, state): #This method is called when the quiz is complete.
-        return {"status": "Quiz and roadmap complete."} #This line returns a dictionary with a message indiacting that the quiz and roadmap are complete.
+    def end(self, state):
+        return {"status": "Quiz and roadmap complete."}
 
-    def build_graph(self): #This method builds the state machine for the quiz application.
-        graph = StateGraph(state_schema=QuizState) #This line creates a state machine object with the QuizState schema.
-        graph.add_node("start_quiz", self.start_quiz) #This line adds a node to the state machine that represents the start of the quiz.
-        graph.add_node("evaluate_quiz", self.evaluate_quiz) #This line adds a node to the state machine that represents the evaluation of the quiz.
-        graph.add_node("check_proficiency", self.check_proficiency) #This line adds a node to the state machine that check the proficiency of the quiz.
-        graph.add_node("suggest_roadmap", self.suggest_roadmap) #This line adds a node to the state machine that suggest the roadmap for the quiz.
-        graph.add_node("store_result", self.store_result) #This line adds a node to the state machine that store the result of the quiz.
-        graph.add_node("end", self.end)#This line adds a node to the state machine that represents the end of the quiz.
+    def build_graph(self):
+        graph = StateGraph(state_schema=QuizState)
+        graph.add_node("start_quiz", self.start_quiz)
+        graph.add_node("evaluate_quiz", self.evaluate_quiz)
+        graph.add_node("check_proficiency", self.check_proficiency)
+        graph.add_node("suggest_roadmap", self.suggest_roadmap)
+        graph.add_node("store_result", self.store_result)
+        graph.add_node("end", self.end)
 
-        graph.set_entry_point("start_quiz") #This line sets the entry point of the state machine to the start_quiz mode.
-        graph.add_edge("start_quiz", "evaluate_quiz") #This line adds an edge from the start_quiz node to the evaluate_quiz node.
-        graph.add_edge("evaluate_quiz", "check_proficiency") #This line adds an edge from the evaluate_quiz node to the check_proficiency node.
-        graph.add_edge("check_proficiency", "suggest_roadmap") #This line adds an edge from the check_proficiency node to the suggest_roadmap node.
-        graph.add_edge("suggest_roadmap", "store_result") #This line adds an edge from the suggest_roadmap node to the store_result node.
-        graph.add_edge("store_result", "end") #This line adds an edge from the store_result node to the end node.
+        graph.set_entry_point("start_quiz")
+        graph.add_edge("start_quiz", "evaluate_quiz")
+        graph.add_edge("evaluate_quiz", "check_proficiency")
+        graph.add_edge("check_proficiency", "suggest_roadmap")
+        graph.add_edge("suggest_roadmap", "store_result")
+        graph.add_edge("store_result", "end")
 
-        return graph #This line returns the state machine object.
+        return graph
 
-    def run_quiz_graph(self, user_name: str, user_answers: Dict[str, str]) -> List[str]: #This method runs the quiz application.
-        final_state = self.app.invoke({ #This line invokes the state machine with the user's name and answers.
-            "user_name": user_name, #This line adds the user's name to the state.
-            "user_answers": user_answers #This line adds the user's answers to the state.
+    def run_quiz_graph(self, user_name: str, user_answers: Dict[str, str]) -> List[str]:
+        final_state = self.app.invoke({
+            "user_name": user_name,
+            "user_answers": user_answers
         })
-        return final_state.get("roadmap", []) #This line returns the roadmap from the state.
+        return final_state.get("roadmap", [])
+
+    # Task management methods
+    def assign_task_to_user(self, user_name: str, user_email: str, level: str, roadmap: List[str]):
+        """Assign a task to a user"""
+        return self.task_manager.assign_task(user_name, user_email, level, roadmap)
+    
+    def submit_user_task(self, user_email: str, task_id: int, submission_content: str):
+        """Submit a task for a user"""
+        return self.task_manager.submit_task(user_email, task_id, submission_content)
+    
+    def get_user_tasks(self, user_email: str):
+        """Get all tasks for a user"""
+        return self.task_manager.get_user_tasks(user_email)
 
 
 # ------------------ CLI RUNNER ------------------
 
-def run_cli(): #This function is the entry point for the CLI application.
-    app = QuizApp(api_key=openai_api_key) #This line creates an instance of the QuizApp class.
-    print("\n Welcome to the Personalized Learning Quiz\n") #This line prints a welcome message.
-    user_name = input("Enter your name: ").strip() #This line prompts the user to enter their name and strips any leading or trailing whitespace.
+def run_cli():
+    app = QuizApp(api_key=openai_api_key)
+    print("\n Welcome to the Personalized Learning Quiz\n")
+    user_name = input("Enter your name: ").strip()
 
     # Just call the start_quiz method directly
-    initial_state = {"user_name": user_name} #This line creates a dictionary with the user's name.
-    start_response = app.start_quiz(initial_state) #This line invokes the start_quiz method with the initial state.
-    questions = start_response.get("quiz", {}) #This line retrieves the quiz questions from the start_response.
+    initial_state = {"user_name": user_name}
+    start_response = app.start_quiz(initial_state)
+    questions = start_response.get("quiz", {})
 
-    print("\nAnswer the following questions (type a, b, c, or d):\n") #This line prints a message asking the user to answer the quetions.
+    print("\nAnswer the following questions (type a, b, c, or d):\n")
 
-    answers = {} #This line creates an empty dictionary to store the user's answers.
-    for q_num, q_data in questions.items(): #This loop iterates through each question number (q_num) and question data (q_data) from the questions dictionary.
-        print(f"{q_num}. {q_data['text']}") #This line prints the question number and question text.
-        for opt, val in q_data["options"].items(): #This loop iterates through each option (opt) and value (val) from the question data.
-            print(f"   {opt}) {val}") #This line prints the option and value.
-        while True: #This loop prompts the user to enter their answer until they provide a valid input.
-            user_answer = input("Your answer (a/b/c/d): ").lower().strip() #This line prompts the user to enter their answer and strips any leading or trailing whitespace.
-            if user_answer in q_data["options"]: #This condition checks if the user's answer is in the question options.
-                answers[q_num] = user_answer #This line adds the user's answer to the answers dictionary.
+    answers = {}
+    for q_num, q_data in questions.items():
+        print(f"{q_num}. {q_data['text']}")
+        for opt, val in q_data["options"].items():
+            print(f"   {opt}) {val}")
+        while True:
+            user_answer = input("Your answer (a/b/c/d): ").lower().strip()
+            if user_answer in q_data["options"]:
+                answers[q_num] = user_answer
                 break 
             else:
-                print("Invalid input. Please choose a, b, c, or d.") #This line prints a message asking the user to choose a, b, c, or d.
-        print() #This line prints a blank line
+                print("Invalid input. Please choose a, b, c, or d.")
+        print()
 
     # Now run the full graph with user answers
-    roadmap = app.run_quiz_graph(user_name, answers) #This line invokes the run_quiz_graph method with the user's name and answers.
-    print(f"\nRecommended Roadmap for {user_name}:\n") #This line prints a message indicating the recommended roadmap for the user.
-    for line in roadmap: #This loop iterates through each line in the roadmap.
-        print(line) #This line prints the line.
+    roadmap = app.run_quiz_graph(user_name, answers)
+    print(f"\nRecommended Roadmap for {user_name}:\n")
+    for line in roadmap:
+        print(line)
 
 
 if __name__ == "__main__": 
