@@ -16,7 +16,7 @@ from passlib.context import CryptContext# Import password hashing and verificati
 backend_dir = os.path.dirname(os.path.abspath(__file__))# Determine backend directory path based on this file’s location
 sys.path.append(backend_dir)# Add backend directory to Python’s search path so local imports work
 
-from node_funcs import QuizApp, openai_api_key# Import main application logic (QuizApp) and API key from node_funcs module
+from quiz_app import QuizApp, openai_api_key# Import main application logic (QuizApp) and API key from node_funcs module
 
 
 # Instantiate core app and services
@@ -28,7 +28,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev_secret_change_me")# Load JWT secret ke
 JWT_ALGO = "HS256"# Set the algorithm used for JWT signing
 ACCESS_TOKEN_EXPIRE_MINUTES = 12 * 60# Define token expiration time (12 hours in minutes)
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")# Create a password hashing context using bcrypt
+# Prefer a pure-Python hash (pbkdf2_sha256) to avoid platform issues, but also verify existing bcrypt hashes
+pwd_context = CryptContext(schemes=["pbkdf2_sha256", "bcrypt"], deprecated="auto")# Create a password hashing context using pbkdf2 (default) and bcrypt for compatibility
 
 
 def hash_password(password: str) -> str:# Hash a plain-text password
@@ -161,6 +162,10 @@ def register(payload: RegisterRequest, requester: Optional[dict] = Depends(get_o
         )
         user_id = cursor.lastrowid# Get the auto-generated user ID of the newly inserted user
         conn.commit()
+        try:
+            print(f"[AUTH] Registered user id={user_id} email={payload.email.strip().lower()} role={desired_role}")
+        except Exception:
+            pass
     except sqlite3.IntegrityError:# Email already exists, close connection and return error
         conn.close()
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -180,7 +185,12 @@ def login(payload: LoginRequest):
     if not row: # If no matching user found, reject login
         raise HTTPException(status_code=401, detail="Invalid credentials")
     user_id, name, email, password_hash, role = row # Extract user details
-    if not verify_password(payload.password, password_hash):# Verify password hash matches provided password
+    verified = verify_password(payload.password, password_hash)
+    try:
+        print(f"[AUTH] Login attempt email={payload.email.strip().lower()} verified={bool(verified)} scheme={'bcrypt' if password_hash.startswith('$2') else 'pbkdf2' if 'pbkdf2' in password_hash else 'unknown'}")
+    except Exception:
+        pass
+    if not verified:# Verify password hash matches provided password
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token({"sub": str(user_id)})# Create JWT token for authenticated user
     return AuthResponse(token=token, name=name, email=email, role=role)# Return authentication response

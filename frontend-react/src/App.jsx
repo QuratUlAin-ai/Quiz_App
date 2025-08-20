@@ -137,36 +137,66 @@ export default function App() { // Define and export the main application compon
   const handleLogin = async (email, password) => {// Function to handle user login
     setLoadingText('Signing you in...')// Show loading message for login process
     setPage(PAGES.LOADING) // Switch to the loading page
-    const res = await apiLogin(email, password) // Call API to log the user in
-    localStorage.setItem('auth_token', res.token)// Save authentication token to local storage
-    localStorage.setItem('auth_name', res.name)// Save user's name to local storage
-    localStorage.setItem('auth_email', res.email)// Save user's email to local storage
-    localStorage.setItem('auth_role', res.role)// Save user's role to local storage
-    setAuth({ token: res.token, name: res.name, email: res.email, role: res.role })// Update authentication state in React
-    setUserName(res.name || '')// Store user's name in component state
-    if (res.role === 'admin') { // If user is an admin, load admin users and switch to admin page
-      await loadAdminUsers()
-      setPage(PAGES.ADMIN_USERS)
-    } else {
-      setPage(PAGES.WELCOME)// Otherwise, go to the welcome page
+    try { // Try to log the user in
+      const res = await apiLogin(email, password) // Call API to log the user in
+      localStorage.setItem('auth_token', res.token)// Save authentication token to local storage
+      localStorage.setItem('auth_name', res.name)// Save user's name to local storage
+      localStorage.setItem('auth_email', res.email)// Save user's email to local storage
+      localStorage.setItem('auth_role', res.role)// Save user's role to local storage
+      setAuth({ token: res.token, name: res.name, email: res.email, role: res.role })// Update authentication state in React
+      setUserName(res.name || '')// Store user's name in component state
+      if (res.role === 'admin') { // If user is an admin, load admin users and switch to admin page
+        await loadAdminUsers()
+        setPage(PAGES.ADMIN_USERS)
+      } else {
+        // Directly start the quiz for normal users after successful login
+        setLoadingText('Preparing your quiz...')  // Show loading message while quiz is prepared
+        const effectiveName = (res.name || userName || '').trim() // Determine user's name (from response or manual input)
+        if (!effectiveName) {
+          setPage(PAGES.WELCOME) // Fallback to welcome if name missing
+        } else {
+          const data = await startQuiz(effectiveName) // Fetch quiz data from API
+          setQuiz(data.quiz) // Store quiz data in state
+          setAnswers({})// Reset answers state to empty
+          setPage(PAGES.QUIZ)// Switch to quiz page
+        }
+      }
+    } catch (e) { // On error, return to login page so the error can be shown
+      setPage(PAGES.LOGIN)
+      throw e
     }
   }
 
   const handleRegister = async (name, email, password) => {// Function to handle user registration
     setLoadingText('Creating your account...')    // Show loading message for registration process
     setPage(PAGES.LOADING)// Switch to loading page
-    const res = await apiRegister(name, email, password)// Call API to register the user
-    localStorage.setItem('auth_token', res.token)// Save authentication token to local storage
-    localStorage.setItem('auth_name', res.name)// Save user's name to local storage
-    localStorage.setItem('auth_email', res.email)// Save user's email to local storage
-    localStorage.setItem('auth_role', res.role)// Save user's role to local storage
-    setAuth({ token: res.token, name: res.name, email: res.email, role: res.role })// Update authentication state in React
-    setUserName(res.name || '')// Store user's name in component state
-    if (res.role === 'admin') {// If user is an admin, load admin users and switch to admin page
-      await loadAdminUsers()
-      setPage(PAGES.ADMIN_USERS)
-    } else {
-      setPage(PAGES.WELCOME)// Otherwise, go to the welcome page
+    try { // Try to register the user
+      const res = await apiRegister(name, email, password)// Call API to register the user
+      localStorage.setItem('auth_token', res.token)// Save authentication token to local storage
+      localStorage.setItem('auth_name', res.name)// Save user's name to local storage
+      localStorage.setItem('auth_email', res.email)// Save user's email to local storage
+      localStorage.setItem('auth_role', res.role)// Save user's role to local storage
+      setAuth({ token: res.token, name: res.name, email: res.email, role: res.role })// Update authentication state in React
+      setUserName(res.name || '')// Store user's name in component state
+      if (res.role === 'admin') {// If user is an admin, load admin users and switch to admin page
+        await loadAdminUsers()
+        setPage(PAGES.ADMIN_USERS)
+      } else {
+        // Directly start the quiz for normal users after successful registration
+        setLoadingText('Preparing your quiz...')  // Show loading message while quiz is prepared
+        const effectiveName = (res.name || name || '').trim() // Determine user's name (from response or manual input)
+        if (!effectiveName) {
+          setPage(PAGES.WELCOME) // Fallback to welcome if name missing
+        } else {
+          const data = await startQuiz(effectiveName) // Fetch quiz data from API
+          setQuiz(data.quiz) // Store quiz data in state
+          setAnswers({})// Reset answers state to empty
+          setPage(PAGES.QUIZ)// Switch to quiz page
+        }
+      }
+    } catch (e) { // On error, return to login page so the error can be shown
+      setPage(PAGES.LOGIN)
+      throw e
     }
   }
 
@@ -453,10 +483,13 @@ export default function App() { // Define and export the main application compon
     const submit = async () => {// Function to handle form submission
       try {
         setError('') // Clear any previous error
+        const cleanEmail = (email || '').trim()
+        const cleanPassword = (password || '').trim()
+        const cleanName = (name || '').trim()
         if (mode === 'login') {// If in login mode, call onLogin function
-          await onLogin(email, password)
+          await onLogin(cleanEmail, cleanPassword)
         } else {
-          await onRegister(name, email, password)// If in register mode, call onRegister function
+          await onRegister(cleanName, cleanEmail, cleanPassword)// If in register mode, call onRegister function
         }
       } catch (e) {
         setError(e?.response?.data?.detail || 'Authentication failed')// Show an error message from server or a fallback message
