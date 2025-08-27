@@ -32,10 +32,11 @@ export const submitQuiz = async (userName, answers) => { // Submit quiz answers 
   return data // Return the server's response data
 }
 
-export const assignTask = async (userName, userEmail) => { // Assign a task to a user based on their quiz results
+export const assignTask = async (userName, userEmail, durationWeeks = 4) => { // Assign a task to a user based on their quiz results
   const { data } = await api.post('/tasks/assign', { // Send POST request to '/tasks/assign' with the user's name and email
     user_name: userName,
     user_email: userEmail,
+    duration_weeks: durationWeeks,
   })
   return data // Return the assigned task data from the server
 }
@@ -96,6 +97,11 @@ export const me = async () => { // Get the currently logged-in user's info (requ
 export const getUserSummary = async (email) => { // Retrieve detailed summary of a user (Admin only)
   const { data } = await api.get('/admin/user_summary', { params: { user_email: email } }) // Send GET request to '/admin/user_summary' with the user's email
   return data  // Return the detailed user summary from the server
+}
+
+export const mySummary = async () => { // Get current user's latest quiz and tasks
+  const { data } = await api.get('/user/summary')
+  return data
 }
 
 

@@ -1,10 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react' // Import React core and specific hooks for state, side effects, and memoization
-import { startQuiz, submitQuiz, assignTask, getUsers, getTaskFiles, uploadTaskFile, getTasks as apiGetTasks, submitTask as apiSubmitTask, login as apiLogin, register as apiRegister, me as apiMe, getUserSummary } from './api' // Import all necessary API functions from the local 'api' module
+import { startQuiz, submitQuiz, assignTask, getUsers, getTaskFiles, uploadTaskFile, getTasks as apiGetTasks, submitTask as apiSubmitTask, login as apiLogin, register as apiRegister, me as apiMe, getUserSummary, mySummary } from './api' // Import all necessary API functions from the local 'api' module
 
 const PAGES = {// Define all possible page states for the application
   WELCOME: 'WELCOME', // Welcome screen
   QUIZ: 'QUIZ', // Quiz-taking screen
   RESULTS: 'RESULTS', // Quiz results screen
+  DURATION_INPUT: 'DURATION_INPUT', // Duration input screen
   TASK_ASSIGN: 'TASK_ASSIGN', // Assign task screen (admin)
   ADMIN_USERS: 'ADMIN_USERS', // Admin user list screen
   ADMIN_DASHBOARD: 'ADMIN_DASHBOARD', // Admin dashboard screen
@@ -35,6 +36,9 @@ export default function App() { // Define and export the main application compon
   const [results, setResults] = useState(null)// Track quiz results returned from the server
   const roadmapText = useMemo(() => (results?.roadmap || []).join('\n'), [results])   // Compute and memoize the roadmap text from the quiz results
 
+  // Duration state
+  const [durationWeeks, setDurationWeeks] = useState(4) // Default duration in weeks
+
   // Task assign state
   const [taskUserName, setTaskUserName] = useState('')   // Track task assignment form's "user name" field (admin use)
   const [taskEmail, setTaskEmail] = useState('')   // Track task assignment form's "email" field (admin use)
@@ -54,6 +58,80 @@ export default function App() { // Define and export the main application compon
   // My tasks (user profiling)
   const [myTasks, setMyTasks] = useState([])// Track tasks assigned to the current logged-in user
   const [myTasksMsg, setMyTasksMsg] = useState('')// Track any message shown in the "My Tasks" section
+
+  // --- Navigation helpers ---
+  const getNavOrder = () => { // Determine navigation order based on role
+    if (!auth) return [PAGES.LOGIN]
+    if (auth.role === 'admin') {
+      return [PAGES.ADMIN_USERS, PAGES.ADMIN_DASHBOARD]
+    }
+    // user flow
+    return [PAGES.WELCOME, PAGES.QUIZ, PAGES.DURATION_INPUT, PAGES.RESULTS, PAGES.TASK_ASSIGN, PAGES.MY_TASKS]
+  }
+
+  const canVisit = (p) => { // Keep guard permissive for history navigation
+    if (!p) return false
+    // Allow navigating; components already guard their content (by checking auth/quiz/results)
+    return true
+  }
+
+  const findPrevPage = () => { // Find previous navigable page
+    const order = getNavOrder()
+    const idx = order.indexOf(page)
+    for (let i = idx - 1; i >= 0; i--) {
+      if (canVisit(order[i])) return order[i]
+    }
+    return null
+  }
+  const findNextPage = () => { // Find next navigable page
+    const order = getNavOrder()
+    const idx = order.indexOf(page)
+    for (let i = idx + 1; i < order.length; i++) {
+      if (canVisit(order[i])) return order[i]
+    }
+    return null
+  }
+
+  const goPrev = () => { // Navigate to previous page if available
+    const prev = findPrevPage()
+    if (prev) setPage(prev)
+  }
+  const goNext = () => { // Navigate to next page if available
+    const next = findNextPage()
+    if (next) setPage(next)
+  }
+
+  // --- Browser history sync (enable back/forward arrows) ---
+  const isPopNavigatingRef = React.useRef(false)
+
+  useEffect(() => { // Initialize current state in history
+    const initial = { page }
+    try { window.history.replaceState(initial, '', `#${page}`) } catch {}
+    const onPop = (e) => {
+      const hashPage = (window.location.hash || '').replace('#', '')
+      const target = e.state?.page || hashPage
+      if (target && target !== page) {
+        isPopNavigatingRef.current = true
+        setPage(target)
+      }
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => { // Push new entries when page changes (not during popstate)
+    if (isPopNavigatingRef.current) { isPopNavigatingRef.current = false; return }
+    // Keep hash and state in sync for direct reloads/bookmarks
+    const urlHash = `#${page}`
+    try {
+      if (window.location.hash !== urlHash) {
+        window.history.pushState({ page }, '', urlHash)
+      } else {
+        window.history.pushState({ page }, '')
+      }
+    } catch {}
+  }, [page])
 
   // -------- Auth Effects --------
   useEffect(() => {// useEffect hook to check authentication status on first render
@@ -76,6 +154,21 @@ export default function App() { // Define and export the main application compon
           setPage(PAGES.ADMIN_USERS)
           return
         }
+        // For regular users: if they already have tasks assigned previously, skip quiz and show roadmap + tasks
+        try {
+          const sum = await mySummary()
+          const hasTasks = Array.isArray(sum?.tasks) && sum.tasks.length > 0
+          const hasRoadmap = Array.isArray(sum?.quiz?.roadmap) && sum.quiz.roadmap.length > 0
+          if (hasTasks) {
+            // Set results so roadmap can render
+            if (hasRoadmap) setResults({ score: sum.quiz?.score ?? 0, level: sum.quiz?.level ?? '—', roadmap: sum.quiz.roadmap })
+            // Load tasks into My Tasks
+            setMyTasks(sum.tasks)
+            setMyTasksMsg(sum.tasks.length ? '' : 'No tasks assigned yet.')
+            setPage(PAGES.MY_TASKS)
+            return
+          }
+        } catch {}
       } catch (e) {
         // invalid token // If the token is invalid, clear all stored auth data
         localStorage.removeItem('auth_token')
@@ -150,15 +243,41 @@ export default function App() { // Define and export the main application compon
         setPage(PAGES.ADMIN_USERS)
       } else {
         // Directly start the quiz for normal users after successful login
-        setLoadingText('Preparing your quiz...')  // Show loading message while quiz is prepared
-        const effectiveName = (res.name || userName || '').trim() // Determine user's name (from response or manual input)
-        if (!effectiveName) {
-          setPage(PAGES.WELCOME) // Fallback to welcome if name missing
-        } else {
-          const data = await startQuiz(effectiveName) // Fetch quiz data from API
-          setQuiz(data.quiz) // Store quiz data in state
-          setAnswers({})// Reset answers state to empty
-          setPage(PAGES.QUIZ)// Switch to quiz page
+        // But if the user already has tasks from before, skip quiz and show roadmap + tasks
+        try {
+          setLoadingText('Loading your learning journey...')
+          const sum = await mySummary()
+          const hasTasks = Array.isArray(sum?.tasks) && sum.tasks.length > 0
+          const hasRoadmap = Array.isArray(sum?.quiz?.roadmap) && sum.quiz.roadmap.length > 0
+          if (hasTasks) {
+            if (hasRoadmap) setResults({ score: sum.quiz?.score ?? 0, level: sum.quiz?.level ?? '—', roadmap: sum.quiz.roadmap })
+            setMyTasks(sum.tasks)
+            setMyTasksMsg(sum.tasks.length ? '' : 'No tasks assigned yet.')
+            setPage(PAGES.MY_TASKS)
+          } else {
+            setLoadingText('Preparing your quiz...')
+            const effectiveName = (res.name || userName || '').trim()
+            if (!effectiveName) {
+              setPage(PAGES.WELCOME)
+            } else {
+              const data = await startQuiz(effectiveName)
+              setQuiz(data.quiz)
+              setAnswers({})
+              setPage(PAGES.QUIZ)
+            }
+          }
+        } catch {
+          // Fallback to quiz if summary fails
+          setLoadingText('Preparing your quiz...')
+          const effectiveName = (res.name || userName || '').trim()
+          if (!effectiveName) {
+            setPage(PAGES.WELCOME)
+          } else {
+            const data = await startQuiz(effectiveName)
+            setQuiz(data.quiz)
+            setAnswers({})
+            setPage(PAGES.QUIZ)
+          }
         }
       }
     } catch (e) { // On error, return to login page so the error can be shown
@@ -183,15 +302,16 @@ export default function App() { // Define and export the main application compon
         setPage(PAGES.ADMIN_USERS)
       } else {
         // Directly start the quiz for normal users after successful registration
-        setLoadingText('Preparing your quiz...')  // Show loading message while quiz is prepared
-        const effectiveName = (res.name || name || '').trim() // Determine user's name (from response or manual input)
+        // Freshly registered users won't have tasks yet. Proceed to quiz as before.
+        setLoadingText('Preparing your quiz...')
+        const effectiveName = (res.name || name || '').trim()
         if (!effectiveName) {
-          setPage(PAGES.WELCOME) // Fallback to welcome if name missing
+          setPage(PAGES.WELCOME)
         } else {
-          const data = await startQuiz(effectiveName) // Fetch quiz data from API
-          setQuiz(data.quiz) // Store quiz data in state
-          setAnswers({})// Reset answers state to empty
-          setPage(PAGES.QUIZ)// Switch to quiz page
+          const data = await startQuiz(effectiveName)
+          setQuiz(data.quiz)
+          setAnswers({})
+          setPage(PAGES.QUIZ)
         }
       }
     } catch (e) { // On error, return to login page so the error can be shown
@@ -227,7 +347,7 @@ export default function App() { // Define and export the main application compon
     const effectiveName = auth?.name || userName// Determine effective name to send with submission
     const data = await submitQuiz(effectiveName, answers)// Send answers to the API
     setResults(data)// Store results returned by the API
-    setPage(PAGES.RESULTS)// Switch to results page
+    setPage(PAGES.DURATION_INPUT)// Switch to duration input page instead of results
   }
 
   // --- Roadmap rendering helpers ---
@@ -354,17 +474,22 @@ export default function App() { // Define and export the main application compon
     }
     setLoadingText('Assigning your task...')// Show loading message while assigning task
     setPage(PAGES.LOADING)// Navigate to loading page
-    const result = await assignTask(taskUserName.trim(), taskEmail.trim())// Call backend to assign task using trimmed name and email
+    const result = await assignTask(taskUserName.trim(), taskEmail.trim(), durationWeeks)// Call backend to assign task using trimmed name and email
     if (result.error) {// If the backend returned an error
       setTaskMessage(`Task Assignment Error: ${result.message}`) // Show a detailed error message
     } else {
       const lines = [// Prepare a list of message lines to display to the user
-        `Task #${result.task_number} assigned to ${taskUserName}.`, // Show assigned task number
+        `Learning journey started for ${taskUserName}!`, // Show assigned task number
+        '',// Blank line for spacing
+        `Task #${result.task_number} of ${durationWeeks * 2} assigned.`, // Show task progress
         '',// Blank line for spacing
         'Task Description:',  // Label for the task description section
         result.task_description,  // Show the actual task description
         '',// Blank line for spacing
         `Due Date: ${result.due_date}`,  // Show task due date
+        '',// Blank line for spacing
+        `Your complete schedule includes ${durationWeeks * 2} tasks over ${durationWeeks} weeks.`, // Show schedule info
+        'Complete each task to unlock the next one in your learning journey.', // Show instructions
         result.email_sent ? `An email has been sent to ${taskEmail}.` : 'Email delivery failed. Check email settings.',// Show whether an email was successfully sent
       ]
       setTaskMessage(lines.join('\n'))// Join all message lines into a single string separated by newlines
@@ -552,6 +677,7 @@ export default function App() { // Define and export the main application compon
         <div className="page-container login-page">
           <div className="content-box">
             <LoginView onLogin={handleLogin} onRegister={handleRegister} />
+            
           </div>
         </div>
       )}
@@ -571,6 +697,7 @@ export default function App() { // Define and export the main application compon
                 <button className="btn primary" onClick={handleStartQuiz}>Start Quiz</button>
               )}
             </div>
+            
           </div>
         </div>
       )}
@@ -602,6 +729,46 @@ export default function App() { // Define and export the main application compon
               </div>
             ))}
             <button className="btn primary" onClick={handleSubmitQuiz}>Submit Quiz</button>
+            
+          </div>
+        </div>
+      )}
+
+      {/* Duration Input Page */}
+      {page === PAGES.DURATION_INPUT && results && (
+        <div className="page-container duration-input-page">
+          <div className="content-box">
+            <div>
+              <h2>Quiz Results for {userName}</h2>
+              <p><strong>Score:</strong> {results.score}/10</p>
+              <p><strong>Level:</strong> {results.level}</p>
+              <hr />
+              <h3>Your Personalized Learning Roadmap</h3>
+              <RoadmapView lines={results.roadmap} />
+            </div>
+            <div style={{ marginTop: 24 }}>
+              <h3>Learning Schedule</h3>
+              <p>How many weeks would you like to spread your learning journey over?</p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
+                <label>Duration (weeks):</label>
+                <input 
+                  type="number" 
+                  min="1" 
+                  max="52" 
+                  value={durationWeeks} 
+                  onChange={(e) => setDurationWeeks(Math.max(1, Math.min(52, parseInt(e.target.value) || 4)))} 
+                  style={{ width: 80 }}
+                />
+              </div>
+              <p style={{ fontSize: 14, color: '#666', marginTop: 8 }}>
+                Tasks will be assigned twice a week over {durationWeeks} weeks ({durationWeeks * 2} total tasks).
+              </p>
+            </div>
+            <div className="row" style={{ marginTop: 24 }}>
+              <button className="btn secondary" onClick={() => setPage(PAGES.WELCOME)}>Take Quiz Again</button>
+              <button className="btn primary" onClick={handleAssignTask}>Start Learning Journey</button>
+            </div>
+            
           </div>
         </div>
       )}
@@ -622,6 +789,7 @@ export default function App() { // Define and export the main application compon
               <button className="btn secondary" onClick={() => setPage(PAGES.WELCOME)}>Take Quiz Again</button>
               <button className="btn primary" onClick={handleAssignTask}>Assign Task</button>
             </div>
+            
           </div>
         </div>
       )}
@@ -640,20 +808,30 @@ export default function App() { // Define and export the main application compon
       {page === PAGES.TASK_ASSIGN && auth && (
         <div className="page-container task-page">
           <div className="content-box">
-            <h3>Assign Learning Task</h3>
-            <p>Enter your email to receive personalized learning tasks based on your quiz performance.</p>
+            <h3>Start Your Learning Journey</h3>
+            <p>Based on your quiz results, we'll create a personalized learning schedule with tasks twice a week over {durationWeeks} weeks.</p>
+            <div style={{ background: '#f8f9fa', padding: 16, borderRadius: 8, marginBottom: 16 }}>
+              <h4 style={{ margin: '0 0 8px 0' }}>Learning Schedule Summary</h4>
+              <p style={{ margin: 0, fontSize: 14 }}>
+                • Duration: {durationWeeks} weeks<br/>
+                • Tasks per week: 2<br/>
+                • Total tasks: {durationWeeks * 2}<br/>
+                • Task frequency: Monday and Thursday
+              </p>
+            </div>
             <div>
               <label>Your Name</label>
               <input value={taskUserName} onChange={(e) => setTaskUserName(e.target.value)} placeholder="Enter your name..." readOnly={auth.role !== 'admin'} />
               <label>Your Email</label>
               <input value={taskEmail} onChange={(e) => setTaskEmail(e.target.value)} placeholder="Enter your email address..." readOnly={auth.role !== 'admin'} />
-              <button className="btn primary" onClick={submitAssignTask}>Assign Task</button>
+              <button className="btn primary" onClick={submitAssignTask}>Start Learning Journey</button>
             </div>
             {taskMessage && <TaskDisplay taskMessage={taskMessage} />}
              {auth.role === 'admin' && (
                <button className="btn sm secondary" style={{ marginTop: 12 }} onClick={() => setPage(PAGES.ADMIN_DASHBOARD)}>Open Admin Dashboard</button>
              )}
             <button className="btn sm" style={{ marginTop: 12 }} onClick={openMyTasksPage}>Open My Tasks</button>
+            
           </div>
         </div>
       )}
@@ -682,6 +860,7 @@ export default function App() { // Define and export the main application compon
                 ))}
               </ul>
             )}
+            
           </div>
         </div>
       )}
@@ -750,6 +929,7 @@ export default function App() { // Define and export the main application compon
               </div>
             )}
             {dashboardMsg && <div style={{ marginTop: 12 }}><pre>{dashboardMsg}</pre></div>}
+            
           </div>
         </div>
       )}
@@ -758,36 +938,47 @@ export default function App() { // Define and export the main application compon
       {page === PAGES.MY_TASKS && auth && (
         <div className="page-container my-tasks-page">
           <div className="content-box">
-            <h3>My Tasks</h3>
+            <h3>My Learning Journey</h3>
             {!myTasks?.length && <p>{myTasksMsg || 'No tasks assigned yet.'}</p>}
             {!!myTasks?.length && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                {myTasks.map((t) => (
-                  <div key={t.id} className="question-container" style={{ background: '#fff' }}>
-                    <div style={{ marginBottom: 8, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
-                      <strong>Task #{t.task_number}</strong>
-                      <span style={{ color: '#6b7280' }}>Due: {t.due_date}</span>
-                      <span style={{ color: t.status === 'completed' ? '#16a34a' : '#6b7280' }}>Status: {t.status}</span>
-                    </div>
-                    <div className="task-description" style={{ marginTop: 8 }}>{t.description}</div>
-                    <div className="row" style={{ marginTop: 12, alignItems: 'center' }}>
-                      <div>
-                        <label>Upload Task File</label>
-                        <input type="file" onChange={(e) => uploadMyTaskFile(t.task_number, e.target.files?.[0])} />
+              <div>
+                <div style={{ background: '#f8f9fa', padding: 16, borderRadius: 8, marginBottom: 16 }}>
+                  <h4 style={{ margin: '0 0 8px 0' }}>Progress Overview</h4>
+                  <p style={{ margin: 0, fontSize: 14 }}>
+                    • Total tasks: {myTasks.length}<br/>
+                    • Completed: {myTasks.filter(t => t.status === 'completed').length}<br/>
+                    • Remaining: {myTasks.filter(t => t.status !== 'completed').length}
+                  </p>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  {myTasks.map((t) => (
+                    <div key={t.id} className="question-container" style={{ background: '#fff' }}>
+                      <div style={{ marginBottom: 8, display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+                        <strong>Task #{t.task_number}</strong>
+                        <span style={{ color: '#6b7280' }}>Due: {t.due_date}</span>
+                        <span style={{ color: t.status === 'completed' ? '#16a34a' : '#6b7280' }}>Status: {t.status}</span>
+                      </div>
+                      <div className="task-description" style={{ marginTop: 8 }}>{t.description}</div>
+                      <div className="row" style={{ marginTop: 12, alignItems: 'center' }}>
+                        <div>
+                          <label>Upload Task File</label>
+                          <input type="file" onChange={(e) => uploadMyTaskFile(t.task_number, e.target.files?.[0])} />
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 8 }}>
+                        <label>Task completed?</label>
+                        <div className="row">
+                          <button className="btn sm primary" onClick={() => markTaskCompleted(t.id)} disabled={t.status === 'completed'}>Yes</button>
+                          <button className="btn sm" onClick={() => setMyTasksMsg('Kept as not completed.')}>No</button>
+                        </div>
                       </div>
                     </div>
-                    <div style={{ marginTop: 8 }}>
-                      <label>Task completed?</label>
-                      <div className="row">
-                        <button className="btn sm primary" onClick={() => markTaskCompleted(t.id)} disabled={t.status === 'completed'}>Yes</button>
-                        <button className="btn sm" onClick={() => setMyTasksMsg('Kept as not completed.')}>No</button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             )}
             {myTasksMsg && <div style={{ marginTop: 12 }}><pre>{myTasksMsg}</pre></div>}
+            
           </div>
         </div>
       )}

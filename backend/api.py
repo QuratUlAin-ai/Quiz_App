@@ -244,6 +244,7 @@ class SubmitQuizResponse(BaseModel):# Define response model for quiz submission
 class AssignTaskRequest(BaseModel): # Define request model for assigning a task
     user_name: str = Field(min_length=1)  # The name of the user receiving the task
     user_email: str = Field(min_length=3) # The email of the user receiving the task
+    duration_weeks: int = Field(default=4, ge=1, le=52) # Duration in weeks for the learning journey
 
 
 class AssignTaskResponse(BaseModel):# Define response model for assigning a task
@@ -323,7 +324,7 @@ def assign_task(payload: AssignTaskRequest):
     except Exception:
         roadmap = []# If parsing fails, set an empty roadmap
 
-    result = quiz_app.assign_task_to_user(payload.user_name, payload.user_email, level, roadmap)# Call the quiz_app logic to assign a task to the user based on quiz data
+    result = quiz_app.assign_task_to_user(payload.user_name, payload.user_email, level, roadmap, payload.duration_weeks)# Call the quiz_app logic to assign a task to the user based on quiz data
 
     # If assignment returned an error (e.g., prerequisites not met), propagate gracefully
     if result.get("error"): # If there was an error in task assignment, return a response with error info
@@ -440,6 +441,80 @@ def admin_user_summary(user_email: str, user=Depends(get_current_user)):
     }
 
 
+# User self summary (non-admin). Returns latest quiz (score/level/roadmap) and tasks for the authenticated user
+@app.get("/user/summary")
+def user_self_summary(user=Depends(get_current_user)):
+    # Identify current user
+    email = user["email"].strip().lower()
+    name = user.get("name")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Latest quiz result by user name
+    quiz_score = None
+    quiz_level = None
+    quiz_roadmap = []
+    if name:
+        cursor.execute(
+            """
+            SELECT score, level, roadmap FROM users
+            WHERE name = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (name,),
+        )
+        qrow = cursor.fetchone()
+        if qrow:
+            quiz_score, quiz_level, roadmap_str = qrow[0], qrow[1], qrow[2]
+            try:
+                quiz_roadmap = [] if not roadmap_str else __import__("json").loads(roadmap_str)
+            except Exception:
+                quiz_roadmap = []
+
+    # Tasks by email
+    cursor.execute(
+        """
+        SELECT id, task_number, task_description, assigned_date, due_date, status, submitted_date, submission_content
+        FROM tasks
+        WHERE user_email = ?
+        ORDER BY task_number
+        """,
+        (email,),
+    )
+    tasks = cursor.fetchall()
+    conn.close()
+
+    def to_url(path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        norm = path.replace("\\", "/")
+        if norm.startswith("uploads/"):
+            return f"/uploads/{norm.split('uploads/', 1)[1]}"
+        return None
+
+    task_items = [
+        {
+            "id": t[0],
+            "task_number": t[1],
+            "description": t[2],
+            "assigned_date": t[3],
+            "due_date": t[4],
+            "status": t[5],
+            "submitted_date": t[6],
+            "file_url": to_url(t[7]),
+        }
+        for t in tasks
+    ]
+
+    return {
+        "name": name,
+        "email": email,
+        "quiz": {"score": quiz_score, "level": quiz_level, "roadmap": quiz_roadmap},
+        "tasks": task_items,
+    }
+
+
 @app.get("/admin/users") # Endpoint for admin to list all non-admin users
 def admin_list_users(user=Depends(get_current_user)):
     if not is_admin(user): # Restrict access to admins only
@@ -505,6 +580,5 @@ async def upload_task_file(
     return {"file_url": url_path} # Return file URL in response
 
 
-# Convenience run: uvicorn backend.api:app --reload
 
 

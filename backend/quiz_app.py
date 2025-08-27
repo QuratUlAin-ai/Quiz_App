@@ -169,7 +169,7 @@ Return the roadmap as a structured list:
             ])
         else:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": "You are an expert tutor that builds personalized learning plans."},
                     {"role": "user", "content": prompt}
@@ -245,9 +245,9 @@ Return the roadmap as a structured list:
         return final_state.get("roadmap", [])
 
     # Task management methods
-    def assign_task_to_user(self, user_name: str, user_email: str, level: str, roadmap: List[str]):# Task management methods (delegated to TaskManager)
+    def assign_task_to_user(self, user_name: str, user_email: str, level: str, roadmap: List[str], duration_weeks: int = 4):# Task management methods (delegated to TaskManager)
         """Assign a task to a user"""
-        return self.task_manager.assign_task(user_name, user_email, level, roadmap)# Calls TaskManager to create and assign a new task based on user's name, email, skill level, and roadmap
+        return self.task_manager.assign_task(user_name, user_email, level, roadmap, duration_weeks)# Calls TaskManager to create and assign a new task based on user's name, email, skill level, and roadmap
     
     def submit_user_task(self, user_email: str, task_id: int, submission_content: str):
         """Submit a task for a user"""
