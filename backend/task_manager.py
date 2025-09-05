@@ -17,8 +17,7 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 email_password = os.getenv("EMAIL_PASSWORD")
 email_address = os.getenv("EMAIL_ADDRESS")
 
-# Gracefully handle missing environment configuration by disabling related features instead of raising
-# hard errors that would prevent the API (and auth endpoints) from running
+
 OPENAI_AVAILABLE = bool(openai_api_key)
 EMAIL_AVAILABLE = bool(email_password and email_address)
 
@@ -191,7 +190,7 @@ class TaskManager: #Define a TaskManager class to handle tasks, database setup, 
         """
         
         response = self.client.chat.completions.create( # Send the constructed prompt to the OpenAI GPT-4o model for task generation
-            model="gpt-4o", # Using OpenAI's GPT-4o model for better reasoning and text generation
+            model="gpt-4o-mini", # Using OpenAI's GPT-4o model for better reasoning and text generation
             messages=[
                 {"role": "system", "content": "You are an expert learning coach that creates personalized, practical learning tasks."},
                 {"role": "user", "content": prompt}  # User's actual prompt with details
@@ -202,12 +201,149 @@ class TaskManager: #Define a TaskManager class to handle tasks, database setup, 
         
         return response.choices[0].message.content.strip() # Extract the generated task text from the AI response, remove extra spaces, and return it
     
-    def assign_task(self, user_name: str, user_email: str, level: str, roadmap: List[str]):# Method to assign a new learning task to a user
+    def create_learning_schedule(self, user_name: str, user_email: str, level: str, roadmap: List[str], duration_weeks: int, total_tasks: int):
+        """Create a complete learning schedule with tasks spread over the specified duration"""
+        try:
+            conn = sqlite3.connect("user_learning.db")
+            cursor = conn.cursor()
+            
+            # Calculate task schedule (twice a week)
+            start_date = datetime.now()
+            task_dates = []
+            
+            # Generate dates for tasks (twice a week)
+            current_date = start_date
+            task_count = 0
+            
+            while task_count < total_tasks:
+                # Add two tasks per week (e.g., Monday and Thursday)
+                if task_count % 2 == 0:  # First task of the week
+                    # Move to next Monday (or today if it's Monday)
+                    days_until_monday = (7 - current_date.weekday()) % 7
+                    if days_until_monday == 0 and task_count == 0:
+                        days_until_monday = 0  # Start today if it's Monday
+                    else:
+                        days_until_monday = days_until_monday if days_until_monday > 0 else 7
+                    current_date = current_date + timedelta(days=days_until_monday)
+                else:  # Second task of the week
+                    # Move to Thursday (3 days after Monday)
+                    current_date = current_date + timedelta(days=3)
+                
+                task_dates.append(current_date)
+                task_count += 1
+            
+            # Generate tasks for the entire schedule
+            previous_task = None
+            for task_number in range(1, total_tasks + 1):
+                # Generate task description
+                task_description = self.generate_task(user_name, level, roadmap, task_number, previous_task)
+                previous_task = task_description
+                
+                # Calculate due date (3 days after task date)
+                task_date = task_dates[task_number - 1]
+                due_date = task_date + timedelta(days=3)
+                
+                # Insert task into database
+                cursor.execute("""
+                INSERT INTO tasks (user_name, user_email, task_number, task_description, assigned_date, due_date, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'scheduled')
+                """, (user_name, user_email, task_number, task_description, task_date.strftime("%Y-%m-%d"), due_date.strftime("%Y-%m-%d")))
+            
+            conn.commit()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            print(f"Error creating learning schedule: {e}")
+            return False
+    
+    def assign_task(self, user_name: str, user_email: str, level: str, roadmap: List[str], duration_weeks: int = 4):# Method to assign a new learning task to a user
         """Assign a new task to the user"""
         conn = sqlite3.connect("user_learning.db")# Connect to the SQLite database
         cursor = conn.cursor()# Create a cursor object to run SQL queries
         
-          # Check if the user already has any tasks assigned
+        # Check if this is the first task assignment for this user
+        cursor.execute("""
+        SELECT COUNT(*) FROM tasks WHERE user_email = ?
+        """, (user_email,))
+        
+        task_count = cursor.fetchone()[0]
+        
+        # If this is the first task, create the complete schedule
+        if task_count == 0:
+            total_tasks = duration_weeks * 2  # Tasks twice a week
+            schedule_created = self.create_learning_schedule(user_name, user_email, level, roadmap, duration_weeks, total_tasks)
+            if not schedule_created:
+                return {
+                    "error": True,
+                    "message": "Failed to create learning schedule."
+                }
+        else:
+            # Existing user: ensure the remaining schedule up to duration_weeks*2 exists
+            # Determine how many tasks the user should have in total
+            total_tasks = duration_weeks * 2
+            # Find current max task_number and its assigned_date to continue cadence
+            cursor.execute(
+                """
+                SELECT task_number, assigned_date FROM tasks
+                WHERE user_email = ?
+                ORDER BY task_number DESC LIMIT 1
+                """,
+                (user_email,)
+            )
+            last_row = cursor.fetchone()
+            if last_row:
+                last_task_number_existing, last_assigned_date_str = last_row
+                # Backfill only if fewer than total_tasks exist
+                if last_task_number_existing < total_tasks:
+                    # Determine starting date for the next task
+                    try:
+                        last_date = datetime.strptime(last_assigned_date_str, "%Y-%m-%d") if last_assigned_date_str else datetime.now()
+                    except Exception:
+                        last_date = datetime.now()
+
+                    # Cadence: +3 days (Mon->Thu), then +4 days (Thu->Mon), alternating
+                    # If last task number is odd, next jump is +3; if even, next jump is +4
+                    next_date = last_date + timedelta(days=(3 if (last_task_number_existing % 2 == 1) else 4))
+
+                    previous_task_text = None
+                    # Fetch last task description to seed follow-up context
+                    cursor.execute(
+                        """
+                        SELECT task_description FROM tasks
+                        WHERE user_email = ? AND task_number = ?
+                        """,
+                        (user_email, last_task_number_existing)
+                    )
+                    prev = cursor.fetchone()
+                    if prev and prev[0]:
+                        previous_task_text = prev[0]
+
+                    for tn in range(last_task_number_existing + 1, total_tasks + 1):
+                        # Generate new scheduled task content
+                        task_description = self.generate_task(user_name, level, roadmap, tn, previous_task_text)
+                        previous_task_text = task_description
+
+                        due_date = next_date + timedelta(days=3)
+
+                        cursor.execute(
+                            """
+                            INSERT INTO tasks (user_name, user_email, task_number, task_description, assigned_date, due_date, status)
+                            VALUES (?, ?, ?, ?, ?, ?, 'scheduled')
+                            """,
+                            (
+                                user_name,
+                                user_email,
+                                tn,
+                                task_description,
+                                next_date.strftime("%Y-%m-%d"),
+                                due_date.strftime("%Y-%m-%d"),
+                            ),
+                        )
+                        # Advance cadence: alternate +3 then +4 days
+                        next_date = next_date + timedelta(days=(3 if (tn % 2 == 1) else 4))
+        
+        # Check if the user already has any tasks assigned
         cursor.execute("""
         SELECT task_number, task_description, status FROM tasks 
         WHERE user_email = ? ORDER BY task_number DESC LIMIT 1
@@ -215,47 +351,57 @@ class TaskManager: #Define a TaskManager class to handle tasks, database setup, 
         
         result = cursor.fetchone()# Get the most recent task record for the user (if any)
         
-          # If the user has no previous tasks, assign Task 1
+        # If the user has no previous tasks, assign Task 1
         if not result:
             task_number = 1
             previous_task = None
         else:
             last_task_number, last_task_description, last_task_status = result# Extract last task details
             
-            # Only assign task 2 if task 1 is completed
-            if last_task_number == 1 and last_task_status != 'completed':# If the last assigned task was Task 1 but not completed, don't assign Task 2 yet
+            # Only assign next task if current task is completed
+            if last_task_status != 'completed':# If the last assigned task is not completed, don't assign a new task yet
                 return {
                     "error": True,
-                    "message": "Task 1 must be completed before Task 2 can be assigned. Please submit your first task first."
-                }
-            elif last_task_number == 2 and last_task_status != 'completed':# If the last assigned task was Task 2 but not completed, don't assign a new task
-                return {
-                    "error": True,
-                    "message": "You already have Task 2 assigned. Please complete it before requesting a new task."
-                }
-            elif last_task_number >= 2:# If the user has completed both available tasks, no new tasks can be assigned
-                return {
-                    "error": True,
-                    "message": "You have completed all available tasks. Great job!"
+                    "message": f"Task {last_task_number} must be completed before the next task can be assigned. Please submit your current task first."
                 }
             
             task_number = last_task_number + 1 # Otherwise, increment the task number and store the last task description
             previous_task = last_task_description
+            
+            # Check if we've reached the end of the schedule
+            total_tasks = duration_weeks * 2
+            if task_number > total_tasks:
+                return {
+                    "error": True,
+                    "message": "You have completed all tasks in your learning journey. Great job!"
+                }
         
-        # Generate new task
-        task_description = self.generate_task(user_name, level, roadmap, task_number, previous_task)# Generate a new task description using the AI model
-        
-        # Calculate due date (3 days from now)
-        assigned_date = datetime.now().strftime("%Y-%m-%d")# Record the date the task was assigned
-        due_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")# Set the due date for 3 days later
-        
-        # Save the newly assigned task into the database
+        # Get the pre-created task from the database
         cursor.execute("""
-        INSERT INTO tasks (user_name, user_email, task_number, task_description, assigned_date, due_date, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-        """, (user_name, user_email, task_number, task_description, assigned_date, due_date))
+        SELECT task_description, due_date FROM tasks 
+        WHERE user_email = ? AND task_number = ?
+        """, (user_email, task_number))
         
-        task_id = cursor.lastrowid # Get the auto-generated task ID for reference
+        task_data = cursor.fetchone()
+        if not task_data:
+            return {
+                "error": True,
+                "message": f"Task {task_number} not found in schedule."
+            }
+        
+        task_description, due_date = task_data
+        
+        # Update task status to assigned
+        cursor.execute("""
+        UPDATE tasks SET assigned_date = ?, status = 'pending' WHERE user_email = ? AND task_number = ?
+        """, (datetime.now().strftime("%Y-%m-%d"), user_email, task_number))
+        
+        # Get the task ID
+        cursor.execute("""
+        SELECT id FROM tasks WHERE user_email = ? AND task_number = ?
+        """, (user_email, task_number))
+        
+        task_id = cursor.fetchone()[0] # Get the task ID
         conn.commit() # Commit the changes to the database
         conn.close() # Close the database connection
         
