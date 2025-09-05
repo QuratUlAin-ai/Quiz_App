@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react' // Import React core and specific hooks for state, side effects, and memoization
-import { startQuiz, submitQuiz, assignTask, getUsers, getTaskFiles, uploadTaskFile, getTasks as apiGetTasks, submitTask as apiSubmitTask, login as apiLogin, register as apiRegister, me as apiMe, getUserSummary, mySummary } from './api' // Import all necessary API functions from the local 'api' module
+import { startQuiz, submitQuiz, assignTask, getUsers, deleteUser, getTaskFiles, uploadTaskFile, getTasks as apiGetTasks, submitTask as apiSubmitTask, login as apiLogin, register as apiRegister, me as apiMe, getUserSummary, mySummary } from './api' // Import all necessary API functions from the local 'api' module
 
 const PAGES = {// Define all possible page states for the application
   WELCOME: 'WELCOME', // Welcome screen
@@ -47,6 +47,7 @@ export default function App() { // Define and export the main application compon
   // Admin users list state
   const [adminUsers, setAdminUsers] = useState([])   // Track the list of all users (for admin view)
   const [adminUsersMsg, setAdminUsersMsg] = useState('')   // Track any message related to admin user management
+  const [deleteConfirm, setDeleteConfirm] = useState(null)   // Track delete confirmation dialog state
 
   // Admin dashboard state
   const [dashboardEmail, setDashboardEmail] = useState('')   // Track the email entered into the admin dashboard search
@@ -372,30 +373,48 @@ export default function App() { // Define and export the main application compon
     const unwrapBold = (s) => s.replace(/^\*\*/, '').replace(/\*\*$/, '').trim() // Removes ** markers from start and end of a bold string
 
     lines.forEach((raw) => {// Iterate through each line of the roadmap text
-      const line = (raw || '').trim()// Trim whitespace and ensure we’re working with a safe string
+      let line = (raw || '').trim()// Trim whitespace and ensure we’re working with a safe string
       if (!line) return// Skip empty lines
 
-      if (isWrappedBold(line)) {// If the line is bold, it could be a section title or an item title
-        const text = unwrapBold(line) // Remove bold markers and get clean text
-        const lower = text.toLowerCase()// Convert text to lowercase for keyword checking
-        const isSection = lower.includes('weak areas') || lower.includes('strong areas')// Determine if this is a "section" header (weak areas / strong areas)
-        if (isSection) {
-          commitSection()// End the previous section before starting a new one
-          currentSection = { title: text, items: [] }// Create a new section with an empty items list
-          return
-        }
-        // Otherwise treat as an item title (e.g., "1. Topic ...")
-        commitItem()// Otherwise treat as an item title under the current section
-        currentItem = { title: text, bullets: [] }// Create a new item with an empty bullet list
+      // Normalize common markdown prefixes: headings '#' and bullets '*'/'-'
+      line = line.replace(/^#+\s*/, '') // strip leading markdown heading hashes
+                 .replace(/^\*\s+/, '') // strip a single leading asterisk bullet
+                 .replace(/^\-\s+/, '') // strip a single leading dash bullet
+                 .replace(/\*\*(.*?)\*\*/g, '$1') // remove any inline **bold** markers globally
+
+      // Detect section headings whether bolded or not
+      const asPlain = isWrappedBold(line) ? unwrapBold(line) : line
+      const lower = asPlain.toLowerCase()
+      const isSection = lower.includes('weak areas') || lower.includes('strong areas')
+      if (isSection) {
+        commitSection()
+        currentSection = { title: asPlain, items: [] }
+        return
+      }
+
+      // If wrapped in bold but not a section, treat as an item title
+      if (isWrappedBold(line)) {
+        const text = unwrapBold(line)
+        commitItem()
+        currentItem = { title: text, bullets: [] }
         return
       }
 
       // Bullets like "• something" or "- something"
-      const bulletMatch = line.match(/^([•\-])\s*(.*)$/)// Detect bullet points starting with • or -
+      const bulletMatch = line.match(/^([•\-*])\s*(.*)$/)// Detect bullet points starting with •, -, or *
       if (bulletMatch) {
         if (!currentItem) currentItem = { title: '', bullets: [] }// If no current item exists, create a placeholder item
         currentItem.bullets.push(bulletMatch[2])// Add the bullet text to the current item’s bullets array
         return
+      }
+      
+      // Handle regular text lines that might be part of an item
+      if (currentItem && line.length > 0) {
+        if (!currentItem.title) {
+          currentItem.title = line
+        } else {
+          currentItem.bullets.push(line)
+        }
       }
     })
 
@@ -405,7 +424,16 @@ export default function App() { // Define and export the main application compon
 
   const RoadmapView = ({ lines }) => {// React component to display the parsed roadmap in a styled layout
     const sections = useMemo(() => parseRoadmap(lines || []), [lines])// Use useMemo to parse roadmap only when lines change
-    if (!sections.length) return <pre style={{ wordWrap: 'break-word', whiteSpace: 'pre-wrap' }}>{(lines || []).join('\n')}</pre>// If no sections found, render raw text with wrapping
+    if (!sections.length) {
+      const cleaned = (lines || []).map((raw) =>
+        String(raw || '')
+          .replace(/^#+\s*/, '')
+          .replace(/^\*\s+/, '')
+          .replace(/^\-\s+/, '')
+          .replace(/\*\*(.*?)\*\*/g, '$1')
+      )
+      return <pre style={{ wordWrap: 'break-word', whiteSpace: 'pre-wrap' }}>{cleaned.join('\n')}</pre>// If no sections found, render cleaned raw text
+    }
     return (// Otherwise, render roadmap sections and items
       <div className="roadmap">
         {sections.map((sec, si) => (
@@ -448,6 +476,40 @@ export default function App() { // Define and export the main application compon
       setAdminUsers([])// On error, clear admin users
       setAdminUsersMsg('Failed to load users.')// Show error message for failed fetch
     }
+  }
+
+  const handleDeleteUser = async (userEmail, userName) => {// Function to handle user deletion
+    setDeleteConfirm({ email: userEmail, name: userName })
+  }
+
+  const confirmDeleteUser = async () => {// Function to confirm and execute user deletion
+    if (!deleteConfirm) return
+    
+    const { email, name } = deleteConfirm
+    
+    try {
+      setLoadingText(`Deleting user ${name}...`)
+      setPage(PAGES.LOADING)
+      
+      const result = await deleteUser(email)
+      
+      if (result.success) {
+        setAdminUsersMsg(`✅ ${result.message}`)
+        // Reload the user list
+        await loadAdminUsers()
+      } else {
+        setAdminUsersMsg(`❌ Failed to delete user: ${result.message || 'Unknown error'}`)
+      }
+    } catch (e) {
+      setAdminUsersMsg(`❌ Error deleting user: ${e?.response?.data?.detail || e.message || 'Unknown error'}`)
+    }
+    
+    setDeleteConfirm(null)
+    setPage(PAGES.ADMIN_USERS)
+  }
+
+  const cancelDeleteUser = () => {// Function to cancel user deletion
+    setDeleteConfirm(null)
   }
 
   const openAdminDashboardForEmail = async (email) => {// Async function to open the admin dashboard for a specific user's email
@@ -530,24 +592,56 @@ export default function App() { // Define and export the main application compon
         {sections.map((section, sectionIndex) => (
           <div key={sectionIndex} className="task-section">
             {section.map((line, lineIndex) => {
-              if (line === 'Task Description:') {
-                return <h4 key={lineIndex} className="task-section-title">{line}</h4>
-              } else if (line === 'Due Date:') {
-                return <h4 key={lineIndex} className="task-section-title">{line}</h4>
-              } else if (line.startsWith('Task #')) {
-                return <div key={lineIndex} className="task-header">{line}</div>
-              } else if (line.startsWith('An email') || line.startsWith('Email delivery')) {
-                return <div key={lineIndex} className="task-status">{line}</div>
-              } else if (line.trim() === '') {
+              // Remove markdown formatting (#, leading * or -) and unwrap **bold** markers
+              const cleanLine = line
+                .replace(/^#+\s*/, '')
+                .replace(/^\*\s+/, '')
+                .replace(/^\-\s+/, '')
+                .replace(/\*\*(.*?)\*\*/g, '$1')
+                .trim()
+              
+              if (cleanLine === 'Task Description:') {
+                return <h4 key={lineIndex} className="task-section-title">{cleanLine}</h4>
+              } else if (cleanLine === 'Due Date:') {
+                return <h4 key={lineIndex} className="task-section-title">{cleanLine}</h4>
+              } else if (cleanLine.startsWith('Task #')) {
+                return <div key={lineIndex} className="task-header">{cleanLine}</div>
+              } else if (cleanLine.startsWith('An email') || cleanLine.startsWith('Email delivery')) {
+                return <div key={lineIndex} className="task-status">{cleanLine}</div>
+              } else if (cleanLine.trim() === '') {
                 return <div key={lineIndex} className="task-spacer"></div>
-              } else if (line.includes(':')) {
-                return <div key={lineIndex} className="task-info">{line}</div>
+              } else if (cleanLine.includes(':')) {
+                return <div key={lineIndex} className="task-info">{cleanLine}</div>
+              } else if (cleanLine.startsWith('Learning journey started') || cleanLine.startsWith('Complete each task') || cleanLine.startsWith('Your complete schedule')) {
+                return <div key={lineIndex} className="task-info">{cleanLine}</div>
               } else {
-                return <div key={lineIndex} className="task-description">{line}</div>
+                return <div key={lineIndex} className="task-description">{cleanLine}</div>
               }
             })}
           </div>
         ))}
+      </div>
+    )
+  }
+
+  // Helper to render plain task descriptions (admin and my tasks lists)
+  const PlainTaskText = ({ text }) => {
+    const lines = String(text || '').split('\n')
+    return (
+      <div>
+        {lines.map((raw, i) => {
+          const clean = raw
+            .replace(/^#+\s*/, '')
+            .replace(/^\*\s+/, '')
+            .replace(/^\-\s+/, '')
+            .replace(/\*\*(.*?)\*\*/g, '$1')
+            .trim()
+          if (!clean) return <div key={i} style={{ height: 4 }} />
+          const isHeading = /:$/g.test(clean)
+          return isHeading
+            ? <div key={i} style={{ fontWeight: 600 }}>{clean}</div>
+            : <div key={i}>{clean}</div>
+        })}
       </div>
     )
   }
@@ -840,7 +934,7 @@ export default function App() { // Define and export the main application compon
       {page === PAGES.ADMIN_USERS && auth?.role === 'admin' && (
         <div className="page-container admin-users-page">
           <div className="content-box">
-            <h3>All Users</h3>
+            <h3>All Users ({adminUsers?.length || 0})</h3>
             {!adminUsers?.length && <p>{adminUsersMsg || 'No users found.'}</p>}
             {!!adminUsers?.length && (
               <ul className="user-list">
@@ -854,11 +948,74 @@ export default function App() { // Define and export the main application compon
                           <span style={{ color: '#6b7280', fontSize: 12 }}>{u.email}</span>
                         </div>
                       </div>
-                      <button className="btn sm primary" onClick={() => openAdminDashboardForEmail(u.email)}>Open Dashboard</button>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button className="btn sm primary" onClick={() => openAdminDashboardForEmail(u.email)}>Dashboard</button>
+                        <button 
+                          className="btn sm danger" 
+                          onClick={() => handleDeleteUser(u.email, u.name)}
+                          title="Delete user and all associated data"
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </div>
                   </li>
                 ))}
               </ul>
+            )}
+            {adminUsersMsg && <div style={{ marginTop: 12, padding: 12, borderRadius: 8, background: adminUsersMsg.includes('✅') ? '#d1fae5' : '#fee2e2', border: adminUsersMsg.includes('✅') ? '1px solid #a7f3d0' : '1px solid #fca5a5' }}>
+              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{adminUsersMsg}</pre>
+            </div>}
+            
+            {/* Delete Confirmation Dialog */}
+            {deleteConfirm && (
+              <div style={{ 
+                position: 'fixed', 
+                top: 0, 
+                left: 0, 
+                right: 0, 
+                bottom: 0, 
+                background: 'rgba(0, 0, 0, 0.5)', 
+                display: 'flex', 
+                alignItems: 'center', 
+                justifyContent: 'center',
+                zIndex: 1000
+              }}>
+                <div style={{ 
+                  background: 'white', 
+                  padding: '24px', 
+                  borderRadius: '12px', 
+                  maxWidth: '500px', 
+                  width: '90%',
+                  boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)'
+                }}>
+                  <h3 style={{ margin: '0 0 16px 0', color: '#dc2626' }}>⚠️ Confirm User Deletion</h3>
+                  <p style={{ margin: '0 0 16px 0', lineHeight: '1.6' }}>
+                    Are you sure you want to delete user <strong>{deleteConfirm.name}</strong> ({deleteConfirm.email})?
+                  </p>
+                  <div style={{ 
+                    background: '#fef2f2', 
+                    border: '1px solid #fecaca', 
+                    borderRadius: '8px', 
+                    padding: '16px', 
+                    margin: '16px 0'
+                  }}>
+                    <p style={{ margin: '0 0 8px 0', fontWeight: '600', color: '#dc2626' }}>This action will permanently remove:</p>
+                    <ul style={{ margin: '0', paddingLeft: '20px', color: '#dc2626' }}>
+                      <li>All their assigned tasks</li>
+                      <li>Quiz results and learning roadmap</li>
+                      <li>Uploaded task files</li>
+                      <li>Progress tracking data</li>
+                      <li>User account and authentication</li>
+                    </ul>
+                    <p style={{ margin: '8px 0 0 0', fontWeight: '600', color: '#dc2626' }}>⚠️ This action cannot be undone!</p>
+                  </div>
+                  <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+                    <button className="btn secondary" onClick={cancelDeleteUser}>Cancel</button>
+                    <button className="btn danger" onClick={confirmDeleteUser}>Delete User</button>
+                  </div>
+                </div>
+              </div>
             )}
             
           </div>
@@ -913,7 +1070,7 @@ export default function App() { // Define and export the main application compon
                       <span style={{ color: t.status === 'completed' ? '#16a34a' : '#6b7280' }}>Status: {t.status}</span>
                       <span style={{ color: '#6b7280' }}>Submitted: {t.status === 'completed' ? 'Yes' : 'No'}</span>
                     </div>
-                    <div className="task-description" style={{ marginTop: 8 }}>{t.description}</div>
+                    <div className="task-description" style={{ marginTop: 8 }}><PlainTaskText text={t.description} /></div>
                     {t.file_url ? (
                       <div style={{ marginTop: 8 }}>
                         <a href={t.file_url} target="_blank" rel="noreferrer">View Uploaded File</a>
@@ -958,7 +1115,7 @@ export default function App() { // Define and export the main application compon
                         <span style={{ color: '#6b7280' }}>Due: {t.due_date}</span>
                         <span style={{ color: t.status === 'completed' ? '#16a34a' : '#6b7280' }}>Status: {t.status}</span>
                       </div>
-                      <div className="task-description" style={{ marginTop: 8 }}>{t.description}</div>
+                      <div className="task-description" style={{ marginTop: 8 }}><PlainTaskText text={t.description} /></div>
                       <div className="row" style={{ marginTop: 12, alignItems: 'center' }}>
                         <div>
                           <label>Upload Task File</label>

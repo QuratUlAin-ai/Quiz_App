@@ -530,6 +530,77 @@ def admin_list_users(user=Depends(get_current_user)):
     ]
     return {"users": users} # Return user list
 
+@app.delete("/admin/users/{user_email}") # Endpoint for admin to delete a user
+def admin_delete_user(user_email: str, user=Depends(get_current_user)):
+    if not is_admin(user): # Restrict access to admins only
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    # Prevent admin from deleting themselves
+    if user_email.lower() == user["email"].lower():
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    
+    conn = get_db_connection() # Connect to database
+    cursor = conn.cursor()
+    
+    try:
+        # Check if user exists
+        cursor.execute("SELECT name, role FROM auth_users WHERE email = ?", (user_email.lower(),))
+        user_to_delete = cursor.fetchone()
+        
+        if not user_to_delete:
+            conn.close()
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        user_name, user_role = user_to_delete
+        
+        # Prevent deletion of other admins
+        if user_role == "admin":
+            conn.close()
+            raise HTTPException(status_code=400, detail="Cannot delete other admin accounts")
+        
+        # Delete user's tasks
+        cursor.execute("DELETE FROM tasks WHERE user_email = ?", (user_email.lower(),))
+        tasks_deleted = cursor.rowcount
+        
+        # Delete user's quiz results
+        cursor.execute("DELETE FROM users WHERE name = ?", (user_name,))
+        quiz_results_deleted = cursor.rowcount
+        
+        # Delete user's progress
+        cursor.execute("DELETE FROM user_progress WHERE user_email = ?", (user_email.lower(),))
+        progress_deleted = cursor.rowcount
+        
+        # Delete user's uploaded files (if any)
+        user_upload_dir = os.path.join("uploads", user_email.lower())
+        if os.path.exists(user_upload_dir):
+            import shutil
+            shutil.rmtree(user_upload_dir)
+        
+        # Finally, delete the user account
+        cursor.execute("DELETE FROM auth_users WHERE email = ?", (user_email.lower(),))
+        user_deleted = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        if user_deleted > 0:
+            return {
+                "success": True,
+                "message": f"User {user_name} ({user_email}) deleted successfully",
+                "details": {
+                    "tasks_deleted": tasks_deleted,
+                    "quiz_results_deleted": quiz_results_deleted,
+                    "progress_deleted": progress_deleted,
+                    "user_deleted": user_deleted
+                }
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Failed to delete user")
+            
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"Error deleting user: {str(e)}")
+
 
 @app.get("/tasks/files") # Endpoint to get the file URLs for a user's tasks
 def get_task_files(user_email: str):

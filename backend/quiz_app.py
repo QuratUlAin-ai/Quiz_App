@@ -187,11 +187,11 @@ Return the roadmap as a structured list:
                 continue
             if stripped.lower().startswith("weak areas") or "reinforce" in stripped.lower():
                 roadmap_lines.append("")
-                roadmap_lines.append(f"**{stripped}**")
+                roadmap_lines.append(stripped)  # Remove ** markers
                 roadmap_lines.append("")
                 continue
             if stripped[:1].isdigit() and "." in stripped[:3]:
-                roadmap_lines.append(f"**{stripped}**")
+                roadmap_lines.append(stripped)  # Remove ** markers
             elif stripped.startswith(("-", "*")):
                 roadmap_lines.append(f"  • {stripped[1:].strip()}")
             else:

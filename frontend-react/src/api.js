@@ -60,6 +60,11 @@ export const getUsers = async () => { // Retrieve the list of all non-admin user
   return data.users  // Return only the "users" array from the response
 }
 
+export const deleteUser = async (userEmail) => { // Delete a user (Admin only)
+  const { data } = await api.delete(`/admin/users/${userEmail}`) // Send DELETE request to '/admin/users/{email}'
+  return data // Return the deletion response
+}
+
 export const getTaskFiles = async (email) => { // Get file URLs for tasks submitted by a specific user
   const { data } = await api.get('/tasks/files', { params: { user_email: email } }) // Send GET request to '/tasks/files' with the user's email
   return data// Return the file URLs for tasks
